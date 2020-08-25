@@ -1,0 +1,1942 @@
+---
+title: "Identification of a novel subgroup of endometrial cancer patients with loss of thyroid hormone receptor expression and improved survival"
+author: "Daniel G. Piqué, John M. Greally, and Jessica C. Mar"
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output: 
+  rmdformats::readthedown:
+    highlight: kate
+    number_sections: true
+    includes:
+      after_body: footer.html
+---
+
+
+
+# Introduction
+
+# Setup and download data
+```{r setup, include=FALSE}
+knitr::opts_knit$set(root.dir = here::here())
+knitr::opts_chunk$set(warning=FALSE, message=FALSE)
+```
+
+
+## Load in the libraries
+
+```{r}
+#library(TCGAbiolinks)  #uncomment if running for first time
+library(SummarizedExperiment)
+library(RColorBrewer)
+library(here)
+library(mclust)
+library(biomaRt)
+library(tidyverse)
+library(janitor)
+library(survival)
+library(ggdendro)
+library(limma)
+library(fgsea)
+library(ggrepel)
+library(patchwork)
+library(receptLoss)
+source(here("scripts", "2019_endomet_smry_suppl.R"))
+```
+
+## Download and filter datasets 
+
+**mRNA expression**
+
+* TCGA-UCEC - Endometrial adenocarcinoma
+* TCGA-BRCA - Breast adenocarcinoma
+* TCGA-LUAD - Lung squamous adenocarcinoma
+* TCGA-LUSC - Lung squamous cell carcinoma
+* TCGA-OV - Ovarian adenocarcinoma
+
+**microRNA expression**
+
+* TCGA-UCEC - Endometrial adenocarcinoma
+
+We use the R package [`TCGAbiolinks`](https://www.bioconductor.org/packages/release/bioc/html/TCGAbiolinks.html){target="_blank"} to download the expression and clinical data from these cancer types in GDC [data release version 13.0](https://docs.gdc.cancer.gov/Data/Release_Notes/Data_Release_Notes/#data-release-130). 
+
+```{r}
+
+project_types <- c("TCGA-UCEC", "TCGA-BRCA", "TCGA-LUAD", "TCGA-LUSC")
+
+if(!file.exists(here("data", paste0(project_types, "-exp.rds")))){
+  ## download the data for each of the 5 cancer types
+  ## uncomment the GDCdownload and saveRDS lines if running for first time
+  eq <- GDCquery(project = project_types,
+                  data.category = c("Transcriptome Profiling"),
+                  data.type = c("Gene Expression Quantification"),
+                  workflow.type = "HTSeq - FPKM")
+  #GDCdownload(eq)
+  
+  ## prepare and save the datasets
+  for(i in 1:length(project_types)){
+    eq <- GDCquery(project = project_types[i],
+                  data.category = c("Transcriptome Profiling"),
+                  data.type = c("Gene Expression Quantification"),
+                  workflow.type = "HTSeq - FPKM")
+    #GDCdownload(eq)
+    e <- GDCprepare(eq, save=FALSE)
+    #saveRDS(e, file=here("data",paste0(project_types[i], "-exp.rds")))
+    print(project_types[i])
+  }
+  
+  #prepare and save the miRNA datasets
+  mi <- GDCquery(project = "TCGA-UCEC",
+                 workflow.type = "BCGSC miRNA Profiling",
+                 data.category = c("Transcriptome Profiling"),
+                 data.type = c("miRNA Expression Quantification"))
+  #GDCdownload(mi)
+  m <- GDCprepare(mi, save=FALSE)
+  #saveRDS(m, file=here("data", "TCGA-UCEC-mirna.rds"))
+
+}
+
+```
+
+
+## Load and clean the endometrial cancer expression data
+```{r}
+
+e <- readRDS(here("data", "TCGA-UCEC-exp.rds")) %>% clean_dataset()
+en <- e$en
+e <- e$et
+  
+esr1 = "ENSG00000091831"
+ar = "ENSG00000169083"
+pr = "ENSG00000082175"
+
+```
+
+
+
+## Perform PCA and look for hospital and sequencing plate bias
+
+```{r}
+pca <- prcomp(t(assay(e)), center = T, scale. = T)
+```
+
+
+### Add centroids (one for each hospital) overlayed on samples
+
+```{r}
+pca.centroids <- aggregate(data.frame(pca$x)[,1:10], list(Type = colData(e)$hosp), mean)
+
+pca.m.hosp <- reshape2::melt(cbind(data.frame(pca$x), hosp=colData(e)$hosp),
+                             id.vars=c("PC1", "PC2","hosp"))
+pca.centroids.hosp <- aggregate(data.frame(pca$x)[,1:10], list(Type = colData(e)$hosp), mean)
+pca.centroids.hosp.m <- reshape2::melt(pca.centroids.hosp, id.vars=c("Type","PC1", "PC2"))
+
+ggplot(pca.centroids.hosp.m, aes(x=PC1, y=PC2, color=Type)) + 
+  geom_point(data=pca.m.hosp, aes(PC1, PC2, color=hosp, alpha=0.2), 
+             alpha=0.1, size=0.5) +
+  centroid_plot_elem()
+```
+
+### Add centroids (one for each sequencing plate) overlayed on samples
+
+```{r}
+pca.m.plate <- reshape2::melt(cbind(data.frame(pca$x), seqPlate=colData(e)$seqPlate), 
+                              id.vars=c("PC1", "PC2","seqPlate"))
+pca.centroids.plate <- aggregate(data.frame(pca$x)[,1:10], list(Type = colData(e)$seqPlate), mean)
+pca.centroids.plate.m <- reshape2::melt(pca.centroids.plate, id.vars=c("Type","PC1", "PC2"))
+
+ggplot(pca.centroids.plate.m, aes(x=PC1, y=PC2, color=Type)) + 
+  geom_point(data=pca.m.plate, aes(PC1, PC2, color=seqPlate, alpha=0.2),
+             alpha=0.1, size=0.5) + 
+  centroid_plot_elem()
+```
+
+We can see that there are no centroids that are visible outliers among either hospitals or sequencing plate. This suggests that the variability observed in the sequencing data is not due to differences in hospitals where the samples were taken from or to differences in the plate that each sample was sequenced on.
+
+## Check and fix BMI clinical data in endometrial cancer
+```{r}
+
+colData(e)$bmi <- colData(e)$weight / (colData(e)$height/100)^2
+plot(colData(e)$weight, colData(e)$height)
+
+#are there any bmi outliers?
+hist(colData(e)$bmi)
+bmiOutlIdx <- which(colData(e)$bmi > threeSdAboveMean(mean(colData(e)$bmi, na.rm=T), sd = sd(colData(e)$bmi, na.rm=T)))
+
+#are there any height outliers?
+hist(colData(e)$height)
+heightOutlIdx <- which(colData(e)$height < threeSdBelowMean(mean(colData(e)$height, na.rm=T), sd = sd(colData(e)$height, na.rm=T)))
+#this looks like it may have been entered in inches. 66 inches is 5 1/2 feet - more likely than 66 cm, which is more likely than 2.16 feet!
+
+#hist(colData(e)$weight)
+weightOutlIdx <- which(colData(e)$weight > threeSdAboveMean(mean(colData(e)$weight, na.rm=T), sd = sd(colData(e)$weight, na.rm=T)))
+
+#if a patient is both a bmi outlier and weight (extremely above) 
+#or height (extremely below) outlier, assume that they are incorrectly 
+#entered in English units (not metric).
+weightOutl <- intersect(weightOutlIdx, bmiOutlIdx)
+heightOutl <- intersect(heightOutlIdx, bmiOutlIdx)
+
+colData(e)[weightOutl,c("weight", "height")] #weight is likely in pounds
+colData(e)[heightOutl,c("weight", "height")] #height is likely in inches
+
+colData(e)[weightOutl,"weight"]  <- poundToKg(colData(e)[weightOutl,"weight"])
+colData(e)[heightOutl,"height"]  <- inToCm(colData(e)[heightOutl,"height"])
+
+plot(colData(e)$weight, colData(e)$height)
+#recompute bmi with new values
+colData(e)$bmi <- colData(e)$weight / (colData(e)$height/100)^2
+
+```
+
+
+### Normalize the clinical data
+
+```{r}
+
+days_last_fu <- ifelse(is.na(colData(e)$days_to_death), colData(e)$days_to_last_follow_up,colData(e)$days_to_death)
+days_last_fu <- ifelse(days_last_fu < 1, 1, days_last_fu)
+days_last_fu <- ifelse(days_last_fu > 365.25 * 5, 365.25 * 5, days_last_fu)
+
+vital_stat <- ifelse(colData(e)$vital_status == "alive", 0, 1)
+vital_stat <- ifelse(days_last_fu >= 365.25 * 5, 0, vital_stat)
+
+colData(e)$days_last_fu_5yr <- days_last_fu
+colData(e)$vital_stat_5yr <- vital_stat
+colData(e)$bmi <- colData(e)$weight / (colData(e)$height/100)^2
+
+#remove the patient with missing survival data
+e <- e[,!is.na(colData(e)$vital_stat_5yr)]
+
+datAddMissing <- function(colDat){
+  #convert to character, add missing label
+  cd <- as.character(colDat)
+  cd[is.na(cd)] <- "Missing"
+  return(cd)
+}
+
+colData(e)$subtype_mrna_expression_cluster <- datAddMissing(colData(e)$subtype_mrna_expression_cluster)
+colData(e)$subtype_IntegrativeCluster <- datAddMissing(colData(e)$subtype_IntegrativeCluster)
+colData(e)$subtype_msi_status_7_marker_call <- datAddMissing(colData(e)$subtype_msi_status_7_marker_call)
+colData(e)$subtype_cna_cluster_k4 <- datAddMissing(colData(e)$subtype_cna_cluster_k4)
+colData(e)$subtype_X2009stagegroup <- datAddMissing(colData(e)$subtype_X2009stagegroup)
+colData(e)$subtype_histology <- datAddMissing(colData(e)$subtype_histology)
+colData(e)$subtype_tumor_grade <- datAddMissing(colData(e)$subtype_tumor_grade)
+colData(e)$subtype_ethnicity <- datAddMissing(colData(e)$subtype_ethnicity)
+colData(e)$race <- datAddMissing(colData(e)$race)
+colData(e)$seqPlate <- datAddMissing(colData(e)$seqPlate)
+colData(e)$hosp <- datAddMissing(colData(e)$hosp)
+
+subtype_mrna_mm <- model.matrix( ~ subtype_mrna_expression_cluster - 1, data=colData(e) )
+subtype_integ_mm <- model.matrix( ~ subtype_IntegrativeCluster - 1, data=colData(e) )
+subtype_msi_mm <- model.matrix( ~ subtype_msi_status_7_marker_call - 1, data=colData(e) )
+subtype_cna_k4_mm <- model.matrix( ~ subtype_cna_cluster_k4 - 1, data=colData(e) )
+stage <- model.matrix( ~ subtype_X2009stagegroup - 1, data=colData(e) )
+histo <- model.matrix( ~ subtype_histology - 1, data=colData(e) )
+grade <- model.matrix( ~ subtype_tumor_grade - 1, data=colData(e) )
+race_mm <- model.matrix( ~ race - 1, data=colData(e) )
+ethnicity_mm <- model.matrix( ~ subtype_ethnicity - 1, data=colData(e))
+seqplate_mm <- model.matrix( ~ seqPlate - 1, data=colData(e))
+hosp_mm <- model.matrix( ~ hosp - 1, data=colData(e))
+
+
+normClinDat <- data.frame(cbind(subtype_mrna_mm, subtype_integ_mm, subtype_msi_mm, subtype_cna_k4_mm, stage, histo, grade, race_mm, ethnicity_mm, seqplate_mm, hosp_mm))
+#remove redundant variables
+duplicated.columns <- duplicated(t(normClinDat))
+normClinDat <- normClinDat[, !duplicated.columns]
+
+#replace continuous variables with the mean
+cont_vars <- c("weight", "height", "days_to_birth", "days_last_fu_5yr", "bmi")
+for(i in 1:ncol(colData(e)[,cont_vars])){
+  colData(e)[,cont_vars][is.na(colData(e)[,cont_vars][,i]), i] <- median(colData(e)[,cont_vars][,i], na.rm = TRUE)
+}
+#replace colData with the median
+#fix height issue - someone probably entered in height in feet, causing a really large BMI. Replace this by either converting to inches or replacing with the colMean (treat as missing)
+
+rescaledDat <- data.frame(scale(colData(e)[,c("weight", "height", "days_to_birth", "bmi")]))
+unscaledDat <- data.frame(colData(e)[,c("weight", "height", "days_to_birth", "bmi")])
+normClinDat <- cbind(normClinDat, unscaledDat, colData(e)[,c("days_last_fu_5yr", "vital_stat_5yr")])
+
+#remove the patient for which we have no survival information on them?
+#add columns for age categories
+
+```
+
+## Print out the clinical data
+
+```{r}
+age <- {colData(e)$days_to_birth / -365.25} 
+age %>% summary()
+age %>% sd()
+
+race <- colData(e)$race
+table(race)
+
+ethnicity <- colData(e)$ethnicity
+table(ethnicity)
+
+histo <- colData(e)$subtype_histology
+table(histo)
+
+stage <- colData(e)$subtype_X2009stagegroup
+table(stage)
+
+surv_5yr <- colData(e)$vital_stat_5yr
+table(surv_5yr)
+
+```
+
+
+## Load the endometrial cancer microRNA data
+```{r}
+
+rpm_str <- "reads_per_million_miRNA_mapped_"
+mir <- readRDS(file=here("data", "TCGA-UCEC-mirna.rds")) %>% 
+  as_tibble %>%
+  dplyr::select(miRNA_ID, starts_with("reads_per_million_miRNA_mapped")) %>%
+  rename_at(vars(-miRNA_ID), funs(substr(., nchar(rpm_str)+1, nchar(.)))) %>%
+  filter(rowSums(.[,2:ncol(.)]) != 0)
+
+sum(rowSums(mir[,2:ncol(mir)]) == 0)
+mir_t <- mir %>% 
+  dplyr::select(which(substr(names(.), 14, 15) == "01")) %>%
+  dplyr::select(which(!duplicated(substr(names(.), 1, 12)))) %>%
+  dplyr::select(which(substr(names(.),1,12) %in% substr(colnames(e), 1,12)))
+
+mir_n <- mir %>% dplyr::select(which(substr(names(.), 14, 15) == "11"))
+```
+
+
+
+## Load the nuclear hormone receptor database
+```{r}
+geneMap <- read_csv(here("data", "ucsc_map", "geneMap.txt")) %>% mutate(ucsc = substr(ucsc, 1,8))
+
+nuclReceptDb <- read_csv(file=here("data", "nucl_recept_db", "targets_and_families.csv")) %>% clean_names()
+## nuclReceptDb <- read.csv(url("http://www.guidetopharmacology.org/DATA/targets_and_families.csv"), header=T)
+nuclReceptDb_sbst <- nuclReceptDb[nuclReceptDb$type == "nhr",]
+
+nuclReceptDb_sbst_ensg <- nuclReceptDb_sbst %>% 
+  left_join(geneMap %>% 
+              dplyr::select(-ucsc, -hgnc_symbol) %>% 
+              distinct, by=c("human_entrez_gene" = "entrezgene"))
+
+
+```
+
+# Identify NHRs with expression loss in a subset of tumors
+
+The following shows the numbers for the workflow.
+```{r}
+
+filtCutoffLower <- 0.2
+
+res <- receptLoss::receptLoss(exprMatrNml=assay(en), exprMatrTum=assay(e), nSdBelow=2, minPropPerGroup=filtCutoffLower)
+
+#Select NHRs with rankings 1 sd above mean of all other genes. 
+diffMeanSd <- mean(res %>% filter(meetsMinPropPerGrp) %>% pull(deltaMu)) + sd(res %>% filter(meetsMinPropPerGrp) %>% pull(deltaMu))
+
+res2 <- res %>% mutate(is_nuclr_recpt = geneNm %in% nuclReceptDb_sbst_ensg$ensembl_gene_id) %>%
+  left_join(nuclReceptDb_sbst_ensg, by=c("geneNm" = "ensembl_gene_id")) %>% 
+  mutate(top_genes = is_nuclr_recpt & meetsMinPropPerGrp & deltaMu > diffMeanSd,
+         oneSdAbove = lowerBound > 0 & meetsMinPropPerGrp & deltaMu > diffMeanSd) 
+
+#unique(nuclReceptDb_sbst_ensg$ensembl_gene_id) %>% .[!is.na(.)] %>% length()
+## Total number of:
+## genes
+nrow(res2)
+
+## NHR ENSG ids
+unique(nuclReceptDb_sbst_ensg$ensembl_gene_id) %>% .[!is.na(.)] %>% length()
+
+## NHRs that overlap with genes that are expressed (selected after initial filt)
+filter(res2, is_nuclr_recpt) %>% nrow()
+
+
+## sum of all genes with boundary greater than 0
+sum(res2$lowerBound > 0)
+
+## sum of all nhrs with boundary greater than 0
+sum({filter(res2, is_nuclr_recpt) %>% pull(lowerBound)} > 0)
+
+
+## sum of all genes with boundary greater than 0 & > 20% samples per group
+filter(res2, lowerBound > 0, meetsMinPropPerGrp) %>% nrow()
+
+## sum of all nhrs with boundary greater than 0 & > 20% samples per group
+filter(res2, is_nuclr_recpt, lowerBound > 0, meetsMinPropPerGrp) %>% nrow()
+
+
+## number of genes (including nhrs) that are 1 sd above mean deltaMu value
+filter(res2, oneSdAbove) %>% nrow()
+
+## number of nhrs that are 1 sd above mean deltaMu value
+top_nhrs <- filter(res2, is_nuclr_recpt, oneSdAbove)# %>% nrow()
+nrow(top_nhrs)
+
+## plot
+set2 <- RColorBrewer::brewer.pal(8,"Set2")
+set3 <- RColorBrewer::brewer.pal(12,"Set3")
+
+delta_mu_plot <- ggplot(res2 %>% filter(meetsMinPropPerGrp, is_nuclr_recpt), aes(x=deltaMu, y = ..density..)) + 
+  geom_histogram(fill=set3[5], color=set3[5], alpha=0.5, bins=40) + 
+  geom_vline(xintercept = diffMeanSd, linetype='dashed') + 
+  theme_classic() + 
+  geom_histogram(data=res2 %>% filter(meetsMinPropPerGrp), aes(x=deltaMu, y = ..density..), 
+                 fill=set3[4], color=set3[4], alpha=0.2, bins=40) + 
+  ggHist + xlab("") + ylab("")
+delta_mu_plot
+ggsave(filename = here("output", "delta_mu_plot.png"), plot = delta_mu_plot, width = 8, height = 5, units = "in")
+
+```
+
+
+## Classify tumors into low or high expression groups using boundary
+
+Add this classification to the `colData(e)` object
+
+```{r}
+
+top_nhrs_ensg <- top_nhrs$geneNm
+
+for(i in 1:length(top_nhrs_ensg)){
+  classific <- returnClassif(tum_matr = e, tum_res = res2, gene = top_nhrs$geneNm[i])
+  colData(e) <- bindClassToColData(cdat = colData(e), classific)
+}
+
+```
+
+## Check for technical bias by sequencing plate for the 6 genes.
+
+```{r message=F, warning=F}
+
+seqPlateClassif <- select(as.data.frame(colData(e)), starts_with("classif_")) %>%
+  data.frame(seqPlate=colData(e)$seqPlate) %>%
+  gather(key = "ensembl_gene_id", value = "bin_expr", 1:(ncol(.)-1))
+
+seqPlateOrd <- orderSeqPlate(seqPlateClassif)
+seqPlateCounts <- countSeqPlate(seqPlateClassif, seqPlateOrd$seqPlate)
+
+numbRows <- 2
+numbPanels <- length(unique(seqPlateCounts$ensembl_gene_id))
+numbPerRow <- numbPanels / numbRows
+seqPlateCounts_sbst1 <- subset(seqPlateCounts,as.character(ensembl_gene_id) %in% as.character(unique(seqPlateCounts$ensembl_gene_id)[1:numbPerRow]))
+seqPlateCounts_sbst2 <- subset(seqPlateCounts,as.character(ensembl_gene_id) %in% as.character(unique(seqPlateCounts$ensembl_gene_id)[numbPerRow+ 1:numbPanels]))
+
+ggplot(data=seqPlateCounts_sbst1, aes(x=seqPlate, y=n, fill=bin_expr)) + ggSeqPlate
+ggplot(data=seqPlateCounts_sbst2, aes(x=seqPlate, y=n, fill=bin_expr)) + ggSeqPlate
+
+#do a chi sq test between all expression plates and expression statuses
+chiSqRes <- c()
+for(var in unique(seqPlateCounts$ensembl_gene_id)){
+  print(var)
+  seqPlateCounts_sbst <- subset(seqPlateCounts, ensembl_gene_id %in% var)
+  chiSqPval <- chisq.test(seqPlateCounts_sbst$bin_expr, seqPlateCounts_sbst$n)$p.value
+  chiSqRes <- c(chiSqRes, chiSqPval)
+}
+names(chiSqRes) <- unique(seqPlateCounts$ensembl_gene_id) #levels(seqPlateCounts$ensembl_gene_id)
+chiSqRes.adj <- p.adjust(chiSqRes, method="BH")
+chiSqRes.adj
+```
+
+## Check for technical bias by sequencing plate for all genes.
+
+```{r}
+
+#boundAll <- apply(assay(en), 1, function(x) twoSdBelowMean(mean(x), sd(x)))
+#boundAll is res2$lowerBound
+res2_arrange <- res2 %>% arrange(geneNm)
+boundAll <- res2_arrange %>% pull(lowerBound) %>% setNames(., nm = res2_arrange$geneNm)
+
+sum(res2$lowerBound > 0) #all genes with boundary greater than 0
+#is only a function of the adjacent normal data
+exprLessThanBound <- rowSums(assay(e) < boundAll)
+exprGrThanBound <- rowSums(assay(e) > boundAll)
+
+filtCutoffLower <- 0.2
+
+boundFiltGenes <- boundAll[{exprGrThanBound/ncol(assay(e)) > filtCutoffLower} & {exprGrThanBound/ncol(assay(e)) < 1-filtCutoffLower} & boundAll > 0]
+
+binIndxMatrGrTh2 <- ifelse(assay(e)[names(boundFiltGenes),] > boundFiltGenes, 1, 0)
+
+
+seqPlateClassif_all <- binIndxMatrGrTh2 %>% 
+  t() %>%
+  data.frame(seqPlate=colData(e)$seqPlate) %>%
+  gather(key = "ensembl_gene_id", value = "bin_expr", 1:(ncol(.)-1))
+
+seqPlateOrdAll <- orderSeqPlate(seqPlateClassif_all)
+seqPlateCountsAll <- countSeqPlate(seqPlateClassif_all, seqPlateOrdAll$seqPlate)
+
+chiSqResAll <- c()
+for(var in levels(seqPlateCountsAll$seqPlate)){
+  seqPlateCounts_sbst <- subset(seqPlateCountsAll, seqPlate %in% var)
+  chiSqPval <- chisq.test(seqPlateCounts_sbst$bin_expr,
+                          seqPlateCounts_sbst$n)$p.value
+  chiSqResAll <- c(chiSqResAll, chiSqPval)
+}
+
+names(chiSqResAll) <- levels(seqPlateCountsAll$ensembl_gene_id)
+chiSqResAll.adj <- p.adjust(chiSqResAll, method="BH")
+min(chiSqResAll.adj)
+```
+
+
+# Identify survival differences based on NHR expression
+
+```{r}
+
+bound_nuHrRcpt_classif <- colData(e) %>% 
+  as.data.frame() %>%
+  select(starts_with("classif_"))
+rownames(bound_nuHrRcpt_classif) <- rownames(colData(e))
+
+abBlwDf2.nhr.top <- res2 %>% filter(is_nuclr_recpt) %>% head()
+
+plot_surv_pval <- c()
+geneNms <- c()
+for(col in 1:length(colnames(bound_nuHrRcpt_classif))){
+  ensg_id <- substr(x = colnames(bound_nuHrRcpt_classif)[col], 9, 23)
+  gnNm <- abBlwDf2.nhr.top %>% 
+    filter(ensg_id == geneNm) %>% 
+    pull(hgnc_symbol)
+  print(gnNm)
+  print(col)
+  receptLoss::plotReceptLoss(exprMatrNml=assay(en), exprMatrTum=assay(e), rldf = res2, geneName=ensg_id, clrs = set2[4:3], addToTitle = paste0(" - ", gnNm))
+  
+  ggsave(filename = here("output", paste0(gnNm, "_hist.png")))
+  plot_surv <- plotSurvAndReturnStat(timeToEvent = colData(e)$days_last_fu_5yr/365.25, 
+                                     alive0dead1 = colData(e)$vital_stat_5yr, 
+                                     classif = colData(e)[,colnames(bound_nuHrRcpt_classif)[col]],
+                                     surv.col = set2[1:2], gnNm = gnNm)
+  ggsave(filename = here("output", paste0(gnNm, "_surv.png")), width = 5, height = 5, units = "in")
+  plot_surv_pval <- c(plot_surv_pval, pvalFxn(plot_surv))
+  geneNms <- c(geneNms, gnNm)
+}
+
+plot_surv_pval.adj <- p.adjust(plot_surv_pval, method = "BH")
+names(plot_surv_pval.adj) <- geneNms
+
+#expression of THRb in normal and canceroustissue 
+isof = "ENSG00000151090"
+tum_class <- c(colData(e)[,"classif_ENSG00000151090"], rep(2,ncol(assay(en)))) %>%
+  as_tibble(x = list(cls = .))
+
+tidyDf <- as.data.frame(cbind(as.numeric(c(assay(e)[isof,], assay(en)[isof,])),
+                      as.factor(c(rep("tumor",ncol(assay(e))),
+                                  rep("normal",ncol(assay(en)))))))
+tidyDf %>% bind_cols(tum_class) %>% group_by(cls) %>% summarise(mn = mean(V1))
+
+#hist of expr of PGR in normal and cancer
+plotGene_bothHist(exprNml=assay(en), exprTum=assay(e), isof = "ENSG00000082175", title="", clrs = set2[4:3])
+plotGene_oneHist(exprNml=assay(en), exprTum=assay(e), isof = "ENSG00000082175", title="", clrs = set2[4:3], vert_line=FALSE)
+
+plotGene_oneHistNmlCurve(exprNml=assay(en), exprTum=assay(e), isof = "ENSG00000082175", title="", clrs = set2[4:3], vert_line=FALSE)
+plotGene_oneHistNmlCurve(exprNml=assay(en), exprTum=assay(e), isof = "ENSG00000082175", title="", clrs = set2[4:3], vert_line=TRUE)
+plotGene_oneHistNmlCurve(exprNml=assay(en), exprTum=assay(e), isof = "ENSG00000082175", title="", clrs = set2[4:3], vert_line=FALSE)
+plotGene_oneHistNmlCurve(exprNml=assay(en), exprTum=assay(e), isof = "ENSG00000082175", title="", clrs = set2[4:3], vert_line=FALSE, histogram = FALSE)
+plotGeneHist2(exprNml=assay(en), exprTum=assay(e), isof = ensg_id, title=gnNm, clrs = set2[4:3])
+
+```
+
+## Identify clinical features of THRB-low subtype
+
+For the following clinical features listed in `cols_of_interest`, there is a 2 x n table showing the distribution of features between tumors that lose THRB expression (0) and tumors that do not lose THRB expression (1). Then, there are 2 additional tables: one representing the proportion of all patients within a given group, and the other representing the proportion of patients normalized to the total # of patients within each THRB group.
+
+For each feature, following each table, there is a visual representation of the last table, containing an unadjusted p-value obtained from the chi-sq test that compares THRB expression status (0 or 1) against the variable of interest (all variables tested happen to be categorical). A list of adjusted p-values across all tested variables appears at the end of this section. The levels of each variable are represented along the outer left y axis, and their representation among each group corresponds, in order, with the colors shown within each bar plot (the inner left y axis contains an incomplete list of variables and is a plotting artifact). 
+
+For example, for the variable "subtype_IntegrativeCluster", 'CN high' tumors represent ~5% of all tumors that lose THRB expression, while 'CN high' tumors represent ~15% of all tumors that do not lose THRB expression. The proportion of tumors represented is shown along the right y axis.
+
+```{r}
+print_tbl <- function(thrb_column, var_column){
+      print(table(thrb_column, var_column) %>% prop.table %>% t %>% data.frame() %>% spread(thrb_column, Freq) %>% map_df(rev) %>% mutate(lvl_sum = `0` + `1`) %>% adorn_totals("row"))
+}
+
+print_tbl_rel <- function(thrb_column, var_column){
+      print(table(thrb_column, var_column) %>% prop.table(1) %>% t %>% data.frame() %>% spread(thrb_column, Freq) %>% map_df(rev) %>% adorn_totals("row") )
+}
+
+cols_of_interest <- c("subtype_IntegrativeCluster", "subtype_msi_status_7_marker_call", "subtype_tumor_grade", "subtype_histology", "subtype_X2009stagegroup") #"subtype_cna_cluster_k4", "subtype_mrna_expression_cluster",
+pval_store <- rep(NA, length(cols_of_interest))
+for(i in 1:length(cols_of_interest)){
+  thrb_classif <- factor(colData(e)[,"classif_ENSG00000151090"])
+  col_int <- factor(colData(e)[,cols_of_interest[i]])
+  pval_store[i] <- chisq.test(thrb_classif, col_int)$p.value
+  print("Absolute # of patients in each group")
+  print(table(colData(e)[,"classif_ENSG00000151090"], colData(e)[,cols_of_interest[i]]))
+  print("Proportion of patients in each group")
+  print_tbl(colData(e)[,"classif_ENSG00000151090"], colData(e)[,cols_of_interest[i]])
+  print("Proportion of patients within each THRB group (0 or 1)")
+  print_tbl_rel(colData(e)[,"classif_ENSG00000151090"], colData(e)[,cols_of_interest[i]])
+  plot(thrb_classif, 
+       col_int, 
+       xlab="THRB status (0=loss of expr)",
+       ylab=paste0(levels(col_int),
+                   collapse = ", "),
+       
+       main=paste0(cols_of_interest[i], "; unadj. pval = ", round(pval_store[i],5)), 
+       cex.lab=2.5, cex.axis=2.5, cex.main=1.5, cex.sub=2.5, yaxt='n', xaxt='n', ann=FALSE)
+}
+
+p.adjust(pval_store, method = "BH") %>% setNames(cols_of_interest)
+
+## post hoc test - thrb and msi and integrative
+integrative_msi_1_other_0 <- colData(e)[,cols_of_interest[1]] %>% sapply(function(x) ifelse(x == "MSI", 0, 1))
+pv_integ <- stats::fisher.test(thrb_classif, integrative_msi_1_other_0) #integrative
+pv_integ
+msi_msih_0_other_1 <- colData(e)[,cols_of_interest[2]] %>% sapply(function(x) ifelse(x == "MSI-H", 0, 1)) #msi
+pv_msi <- stats::fisher.test(thrb_classif, msi_msih_0_other_1) #integrative
+pv_msi
+p.adjust(c(pv_integ$p.value, pv_msi$p.value), method = "BH") %>% setNames(c("integ", "msi"))
+
+
+```
+
+## Look at survival differences between endometroid tumors
+```{r}
+ensg_id <- "ENSG00000151090" #THRB
+gnNm <- abBlwDf2.nhr.top %>% 
+  filter(ensg_id == geneNm) %>% 
+  pull(hgnc_symbol)
+
+colData_e_endometroid <- colData(e) %>% as_tibble %>% filter(subtype_histology == "Endometrioid") %>%
+  DataFrame()
+
+plot_surv <- plotSurvAndReturnStat(timeToEvent = colData_e_endometroid$days_last_fu_5yr/365.25, 
+                                   alive0dead1 = colData_e_endometroid$vital_stat_5yr, 
+                                   classif = colData_e_endometroid[,colnames(bound_nuHrRcpt_classif)[col]],
+                                   surv.col = set2[1:2], gnNm = gnNm)
+
+ggsave(filename = here("output", paste0(gnNm, "_endometrioid_surv.png")))
+plot_surv_pval <- c(plot_surv_pval, pvalFxn(plot_surv))
+```
+
+## Look at survival differences between serous tumors
+```{r}
+colData_e_serous <- colData(e) %>% as_tibble %>% filter(subtype_histology == "Serous") %>%
+  DataFrame()
+
+plot_surv <- plotSurvAndReturnStat(timeToEvent = colData_e_serous$days_last_fu_5yr/365.25, 
+                                   alive0dead1 = colData_e_serous$vital_stat_5yr, 
+                                   classif = colData_e_serous[,colnames(bound_nuHrRcpt_classif)[col]],
+                                   surv.col = set2[1:2], gnNm = gnNm)
+
+ggsave(filename = here("output", paste0(gnNm, "_serous_surv.png")))
+plot_surv_pval <- c(plot_surv_pval, pvalFxn(plot_surv))
+```
+
+# Examine combinatorial relationships between survival groups 
+
+```{r}
+colData(e)$classif_thrb_esr1_pgr <- apply(colData(e)[,c("classif_ENSG00000151090", "classif_ENSG00000091831","classif_ENSG00000082175")], 1, paste0, collapse = "") 
+
+colData(e)$classif_esr1_pgr <- apply(colData(e)[,c( "classif_ENSG00000091831", "classif_ENSG00000082175")], 1, paste0, collapse = "") 
+
+#must have at least 3 observations per group
+subgrps_grth_3 <- colData(e)$classif_thrb_esr1_pgr %>% table %>% .[.>=3] %>% names
+filt_vect <- colData(e)$classif_thrb_esr1_pgr %in% subgrps_grth_3 #c("000", "011", "111", "100")#subgrps_grth_3
+plot_5combo <- plotSurvAndReturnStat(timeToEvent = {colData(e)$days_last_fu_5yr/365.25}[filt_vect], 
+                            alive0dead1 = {colData(e)$vital_stat_5yr}[filt_vect], 
+                            classif = {colData(e)$classif_thrb_esr1_pgr}[filt_vect],
+                            surv.col = set2[c(6:4, 1:3)], gnNm = "")
+
+#now, just look at ER/PGR negative depending on THRB status
+filt_vect2 <- colData(e)$classif_thrb_esr1_pgr %in% c("000", "100")#subgrps_grth_3
+filt_vect2 <- colData(e)$classif_thrb_esr1_pgr %in% c("011", "111")#subgrps_grth_3
+filt_vect2 <- colData(e)$classif_thrb_esr1_pgr %in% c("100", "111")#subgrps_grth_3 #THRB pos
+filt_vect2 <- colData(e)$classif_thrb_esr1_pgr %in% c("000", "011")#subgrps_grth_3 #THRB neg
+
+plot_5combo <- plotSurvAndReturnStat(timeToEvent = {colData(e)$days_last_fu_5yr/365.25}[filt_vect2], 
+                            alive0dead1 = {colData(e)$vital_stat_5yr}[filt_vect2], 
+                            classif = {colData(e)$classif_thrb_esr1_pgr}[filt_vect2],
+                            surv.col = set2[1:2], gnNm = "")
+
+
+subgrps_esr_pgr <- colData(e)$classif_esr1_pgr %>% table %>% .[.>=3] %>% names
+filt_vect3 <- colData(e)$classif_esr1_pgr %in% subgrps_esr_pgr#c("000", "011") 
+
+plot_esr_pgr <- plotSurvAndReturnStat(timeToEvent = {colData(e)$days_last_fu_5yr/365.25}[filt_vect3], 
+                            alive0dead1 = {colData(e)$vital_stat_5yr}[filt_vect3], 
+                            classif = {colData(e)$classif_esr1_pgr}[filt_vect3],
+                            surv.col = set2[1:3], gnNm = "")
+
+#double positive and double negative
+subgrps_esr_pgr_dp_dn <- c("00", "11")#colData(e)$classif_esr1_pgr %>% table %>% .[.>=3] %>% names
+filt_vect4 <- colData(e)$classif_esr1_pgr %in% subgrps_esr_pgr_dp_dn#c("000", "011") 
+
+plot_esr_pgr_dp_dn <- plotSurvAndReturnStat2(timeToEvent = {colData(e)$days_last_fu_5yr/365.25}[filt_vect4], 
+                            alive0dead1 = {colData(e)$vital_stat_5yr}[filt_vect4], 
+                            classif = {colData(e)$classif_esr1_pgr}[filt_vect4],
+                            surv.col = set2[1:2], gnNm = "")
+
+pv_00_11 <- pvalFxn(plot_esr_pgr_dp_dn$fit.stat)
+pv_00_11
+#plot_esr_pgr_dp_dn
+
+#risk of death at 5 years in each group
+sum_survfit_dp_dn <- summary(plot_esr_pgr_dp_dn$fit, times = 5)
+sum_survfit_dp_dn$surv #risk of death at 5 years in each group
+diff(sum_survfit_dp_dn$surv) #difference in 5 year risk of death btw groups
+
+
+ggsave(filename = here::here("output/00_vs_11.png"), device = "png", width = 5)
+
+
+#plot 000 vs 100
+filt_vect5 <- colData(e)$classif_thrb_esr1_pgr %in% c("000", "100") 
+
+# plotSurvAndReturnStat2 does the same as plotSurvAndReturnStat but just returns an additional survfit object ('fit') in a list
+plot_thrb_pos_vs_neg_esr_pgr_dbl_neg <- plotSurvAndReturnStat2(timeToEvent = {colData(e)$days_last_fu_5yr/365.25}[filt_vect5], 
+                            alive0dead1 = {colData(e)$vital_stat_5yr}[filt_vect5], 
+                            classif = {colData(e)$classif_thrb_esr1_pgr}[filt_vect5],
+                            surv.col = set2[4:5], gnNm = "")
+
+plot_thrb_pos_vs_neg_esr_pgr_dbl_neg
+pv_000_100 <- pvalFxn(plot_thrb_pos_vs_neg_esr_pgr_dbl_neg$fit.stat)
+pv_000_100
+
+p.adjust(c(pv_00_11, pv_000_100), method = "BH")
+
+
+#percent alive at 5 years in each group
+surv_tbl <- table({colData(e)$vital_stat_5yr}[filt_vect5], {colData(e)$classif_thrb_esr1_pgr}[filt_vect5]) %>% addmargins()
+surv_perc_5yr <- surv_tbl[1,] / surv_tbl["Sum",]
+surv_perc_5yr
+
+
+#risk of death at 5 years in each group
+sum_survfit <- summary(plot_thrb_pos_vs_neg_esr_pgr_dbl_neg$fit, times = 5)
+sum_survfit$surv #risk of death at 5 years in each group
+diff(sum_survfit$surv) #difference in 5 year risk of death btw groups
+
+ggsave(filename = here::here("output/000_vs_100.png"), device = "png", width = 5)
+
+#plot 011 vs 111
+
+filt_vect6 <- colData(e)$classif_thrb_esr1_pgr %in% c("011", "111") 
+
+plot_thrb_pos_vs_neg_esr_pgr_dbl_neg <- plotSurvAndReturnStat(timeToEvent = {colData(e)$days_last_fu_5yr/365.25}[filt_vect6], 
+                            alive0dead1 = {colData(e)$vital_stat_5yr}[filt_vect6], 
+                            classif = {colData(e)$classif_thrb_esr1_pgr}[filt_vect6],
+                            surv.col = set2[1:2], gnNm = "")
+
+#plot 100 vs 111
+
+filt_vect7 <- colData(e)$classif_thrb_esr1_pgr %in% c("100", "111") 
+
+plot_thrb_pos_vs_neg_esr_pgr_dbl_neg <- plotSurvAndReturnStat(timeToEvent = {colData(e)$days_last_fu_5yr/365.25}[filt_vect7], 
+                            alive0dead1 = {colData(e)$vital_stat_5yr}[filt_vect7], 
+                            classif = {colData(e)$classif_thrb_esr1_pgr}[filt_vect7],
+                            surv.col = set2[1:2], gnNm = "")
+ggsave(filename = here::here("output/100_vs_111.png"), device = "png", width = 5)
+
+```
+
+
+# Test the association between NHR expression and mutations
+
+Read in a list of established oncogenes and tumor suppressors from [COSMIC V83](https://cancer.sanger.ac.uk/cosmic), downloaded Dec. 2, 2017. Then, select the high impact mutations as called by mutect.
+
+```{r}
+cosDat <- read.csv(file= here("data", "cosmic_mut", "Census_all_2017_12_2.csv"), header=T)
+
+#run these two lines if readRDS does not exist
+#maf_mut <- GDCquery_Maf("UCEC", pipelines = "mutect")#2018-12-09
+#saveRDS(maf_mut, file = here("data", "TCGA-mut-mutect-ucec-2018-12.rds"))
+
+mut <- readRDS(here("data","TCGA-mut-mutect-ucec-2018-12.rds"))
+mut.hiImpct <- mut[mut$IMPACT %in% c("HIGH") & mut$Entrez_Gene_Id %in% cosDat$Entrez.GeneId,]
+top50mutGenes <- sort(names(head(sort(table(mut.hiImpct$Hugo_Symbol),decreasing = T), 25)))
+mut.hiImpct.top50 <- mut.hiImpct[mut.hiImpct$Hugo_Symbol %in% top50mutGenes,]
+mut.hiImpct.top50.ptid <- names(table(mut.hiImpct.top50$Tumor_Sample_Barcode))
+
+#which patients are associated with which gene mutations
+#this is a list of patient TCGA ids
+ptIdGeneMut <- sapply(top50mutGenes, function(x) unname(mut.hiImpct.top50[mut.hiImpct.top50$Hugo_Symbol %in% x,"Tumor_Sample_Barcode"]))
+
+ptIdGeneMut.l <- lapply(ptIdGeneMut, function(x) mut.hiImpct.top50.ptid %in% x )
+ptIdGeneMut.l.df <- do.call(rbind, ptIdGeneMut.l)
+colnames(ptIdGeneMut.l.df) <- mut.hiImpct.top50.ptid
+ptIdGeneMut.l.df <- ifelse(ptIdGeneMut.l.df, 1, 0)
+
+#convert to summarized expt object
+mutDat <- SummarizedExperiment(assays=list(mutation = as.matrix(ptIdGeneMut.l.df)))
+
+ptInCommon <- intersect(substr(rownames(bound_nuHrRcpt_classif), 1,12), substr(colnames(assay(mutDat)), 1,12))
+
+#create a histogram of mutation frequencies
+mutFreq <- data.frame(freq=sort(rowSums(assay(mutDat[,sapply(ptInCommon, function(x) grep(x, colnames(mutDat)))])),decreasing = T))
+mutFreq$gene <- rownames(mutFreq) 
+mutFreq$gene <- factor(mutFreq$gene, levels=mutFreq$gene)
+
+mf <- ggplot(mutFreq, aes(x=gene, y=freq/length(ptInCommon))) + 
+  geom_bar(stat = "identity") + 
+  ggBar + 
+  ylab(paste0("Observed Frequency (N=", length(ptInCommon), ")"))
+
+mf
+```
+
+
+## Cluster hormone receptor and mutations status
+
+Note: Both hormone receptor expression status and mutation status are binary variables.
+```{r}
+#hormone receptor expression status
+hrmnStatus.c <- clusterAndReorder(t(bound_nuHrRcpt_classif)[,substr(rownames(bound_nuHrRcpt_classif), 1,12) %in% ptInCommon], dimen = "both")
+colnames(hrmnStatus.c) <- substr(colnames(hrmnStatus.c), 1,12)
+
+#mutation status
+mutDat.c <- clusterAndReorder(assay(mutDat)[,substr(colnames(assay(mutDat)), 1,12) %in% ptInCommon], dimen="both")
+colnames(mutDat.c) <- substr(colnames(mutDat.c), 1,12)
+
+```
+
+## Statistical testing (Fisher's exact) between NHR expression and mutation
+
+Are there associations between oncogene/tumor suppressor mutations and expression of NHRs? Use fisher's exact test to look at relationship between each NHR and each mutation (50x6 matrix). Our 2 matrices are mutDat.c and hrmnStatus.c.sub.
+
+```{r}
+hrmnStatus.c.sub <- hrmnStatus.c[,colnames(mutDat.c)]
+rownames(hrmnStatus.c.sub) <- rownames(hrmnStatus.c.sub) %>%
+                              substr(start = 9, stop = nchar(.)) %>%
+                              match(abBlwDf2.nhr.top$geneNm) %>%
+                              abBlwDf2.nhr.top[.,"hgnc_symbol"] %>% pull
+
+orDat <- array(data = 0, dim = c(nrow(mutDat.c), nrow(hrmnStatus.c.sub), 2), dimnames = list(muts=rownames(mutDat.c), expr=rownames(hrmnStatus.c.sub), oddsRat=c("pValue", "OR")))
+
+for(i in 1:nrow(mutDat.c)){
+  for(j in 1:nrow(hrmnStatus.c.sub)){
+    d1 <- c(mutDat.c[i,]) 
+    d2 <- c(hrmnStatus.c.sub[j,])
+    res <- fisher.test(x = d1, d2)
+    orDat[i,j,1] <- res$p.value
+    orDat[i,j,2] <- res$estimate
+   }
+}
+
+p_val_adj <- orDat[,,1] %>% 
+  as.vector %>% 
+  p.adjust(method = "BH") %>% 
+  matrix(ncol = ncol(orDat[,,1])) %>%
+  as_tibble %>%
+  purrr::set_names(colnames(orDat[,,1])) %>% 
+  mutate(mut = rownames(orDat[,,1])) %>% 
+  gather(key = "nhr", value = "val", 1:(ncol(.)-1)) %>%
+  mutate(qval_or = "qval", sigStar = sig2star(val))
+  
+odd_rat <- orDat[,,2] %>% 
+  data.frame() %>% 
+  rownames_to_column("mut") %>% 
+  gather(key = "nhr", value = "val", 2:ncol(.)) %>% 
+  mutate(qval_or = "OR") %>% 
+  as_tibble() %>%
+  mutate(sigStar = "") %>%
+  bind_rows(p_val_adj) %>%
+  mutate(nhr = factor(nhr, levels=abBlwDf2.nhr.top$hgnc_symbol),
+         mut = factor(mut, levels=rev(mutFreq$gene)))
+
+odd_rat %>% filter(qval_or == "qval" & val < 0.05 & nhr == "THRB")
+
+qv_signif <- odd_rat %>% filter(qval_or == "qval" & val < 0.05)
+or_qv_signif <- odd_rat %>% filter(paste0(mut, nhr) %in% paste0(qv_signif$mut, qv_signif$nhr))
+
+
+md <- ggplot(subset(odd_rat,qval_or=="OR"), aes(y=mut, x=nhr)) +
+  geom_tile(aes(fill=log(val,10)), color="black") + 
+  theme_classic() + 
+  theme(text = element_text(size=20, face="italic"),
+        axis.ticks=element_blank(),
+        axis.title=element_blank(),
+        axis.line = element_blank(), 
+        axis.text.x = element_text(angle=90, hjust = 1, vjust=0.5)) +
+  scale_fill_gradient2(name="log10(Odds Ratio)") +
+  geom_text(data=subset(odd_rat,qval_or=="qval"), aes(label=sigStar), size=6, nudge_y = -.2) +
+  coord_fixed(ratio = .65)
+md
+
+mf
+#md + mf + coord_flip() + scale_y_continuous(position = "right") + scale_x_discrete(limits = rev(levels(mutFreq$gene)))
+
+```
+
+## Calculate Odds Ratio between each *pair* of genes
+
+What's the likelihood that when one is expressed, the other gene is also expressed?
+Use a cutoff of q = 0.01 (Fisher's Exact) for pairwise relationship. Is THRB associated with any other expression statuses?
+```{r}
+z <- bound_nuHrRcpt_classif
+or_matrix <- matrix(ncol=ncol(z), nrow = ncol(z))
+or_pval_matrix <- matrix(ncol=ncol(z), nrow = ncol(z))
+
+for(i in 1:ncol(z)){
+  for(j in 1:ncol(z)){
+    if(i>=j) next
+    xtab <- table(z[,i],z[,j])
+    fisherTestRes <- fisher.test(xtab)
+    
+    oddsRat <- fisherTestRes$estimate
+    or_matrix[j,i] <- oddsRat
+    
+    oddsRat_pval <- fisherTestRes$p.value
+    or_pval_matrix[j,i] <- oddsRat_pval
+  }
+}
+
+colnames(z) -> rownames(or_matrix) -> colnames(or_matrix) -> 
+  rownames(or_pval_matrix) -> colnames(or_pval_matrix)
+
+or_pval_matrix.m <- or_pval_matrix %>% 
+    data.frame() %>%
+  rownames_to_column("row") %>%
+  gather(key = "variable", value = "pvalue", 2:ncol(.)) %>%
+  filter(!is.na(pvalue)) %>%
+  mutate(adjpvalue = p.adjust(pvalue, method="BH"),
+         stars = cut(adjpvalue, 
+                     breaks=c(-Inf, 0.0001, 0.001, 0.01, Inf), 
+                     label=c("***", "**", "*", ""))) %>%
+  mutate(row_var = paste0(row,":",variable)) %>%
+  dplyr::select(-row, -variable)
+
+or_matrix.m <- or_matrix %>%
+  data.frame() %>%
+  rownames_to_column("row") %>%
+  gather(key = "variable", value = "OR", 2:ncol(.)) %>%
+  filter(!is.na(OR)) %>%
+  mutate(OR_cut = cut(OR ,breaks=c(0, 0.01, 0.1, 0.5, 2, 5, 50, Inf),
+                      include.lowest=TRUE,
+                      label=c("(0,0.01)","(0.01,0.1)", "(0.1,0.5)", 
+                              "(0.5,2)", "(2,5)", "(5,50)", "(50,Inf)"))) %>%
+  mutate(row_var = paste0(row,":",variable)) %>%
+  dplyr::select(-row, -variable) %>% 
+  left_join(or_pval_matrix.m, by="row_var") %>%
+  separate(row_var, into = c("col1", "col2"), sep = ":")
+
+gene_key <- data.frame(geneNms)
+rownames(gene_key) <- colnames(bound_nuHrRcpt_classif)
+
+or_matrix.m2 <- or_matrix.m %>% 
+  mutate(col1 = factor(gene_key[col1,], levels=gene_key$geneNms),
+         col2=factor(gene_key[col2,], levels=gene_key$geneNms))
+
+colors_orr_corr_matr <- append(brewer.pal(11,"PuOr")[c(2,4,5,7,8,10)], "#ffffff", after=3) 
+
+fig3a2 <- ggplot(or_matrix.m2, aes(col1, col2)) + 
+  geom_tile(aes(fill=OR_cut),colour="black", size=1.5) + 
+  geom_text(aes(label=stars), color="black", size=8, vjust=1) + 
+  theme_classic() + 
+  theme(axis.line = element_blank(), 
+        text = element_text(size=20), 
+        axis.text =element_text(size=16, color="black", face="italic"), 
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5),
+        axis.ticks = element_blank(), 
+        legend.key.size = unit(1.25,"cm")) + 
+  scale_fill_manual(values = rev(colors_orr_corr_matr), 
+                    name="Odds Ratio", drop=FALSE) + 
+  coord_fixed(ratio = 1) + 
+  scale_y_discrete(position="right") + 
+  xlab("") + ylab("")
+
+fig3a2
+
+or_matrix.m2
+```
+
+# Differential microRNA expression analysis 
+
+We look at the association between miRNAs and THRB expression
+
+## Volcano plot showing miRNA expression
+```{r}
+
+bound_nuHrRcpt_classif_mirna_filt <- bound_nuHrRcpt_classif %>% .[rownames(.) %>% substr(1,12) %in% substr(colnames(mir_t), 1,12),]
+
+
+mir_t2 <- rownames(bound_nuHrRcpt_classif_mirna_filt) %>% 
+  substr(1,12) %>%
+  sapply(grep, colnames(mir_t)) %>%
+  unlist %>%
+  unique %>%
+  mir_t[,.] %>%
+  mutate_all(.funs = ~log(.+1, 2))
+
+mir_n2 <- colnames(en) %>% 
+  substr(1,12) %>%
+  sapply(grep, colnames(mir_n)) %>%
+  unlist %>%
+  mir_n[,.] %>%
+  mutate_all(.funs = ~log(.+1, 2))
+
+e_sub <- substr(colnames(mir_t2), 1,12) %>% 
+  sapply(grep,colnames(e)) %>%
+  e[,.]
+en_sub <- substr(colnames(mir_n2), 1,12) %>% 
+  sapply(grep,colnames(en)) %>%
+  en[,.]
+
+
+#############
+i=6
+classif <- colnames(bound_nuHrRcpt_classif)[i]#"classif_ENSG00000082175"
+vars <- c(classif, "seqPlate", "hosp")
+colData_e_stdze <- colData(e_sub)[,vars]
+dsgn <- model.matrix(~ colData(e_sub)[,classif] + colData(e_sub)[,"seqPlate"] + colData(e_sub)$hosp)
+allDeGenes <- returnDeMirnaLimma(mir_t2, dsgn, colOfInt = 2, retAll=T)
+
+logFCThr = 1
+adjPvalThresh = 0.001
+
+allDeGenes2 <- allDeGenes %>% rownames() %>% 
+  as.numeric() %>% mir$miRNA_ID[.] %>%
+  cbind(allDeGenes, mirna=.) %>%
+  as_tibble() %>%
+  mutate(mirna = as.character(mirna),
+         mirna_label = ifelse(abs(logFC) > logFCThr & adj.P.Val < adjPvalThresh,
+                              mirna,""))
+
+rowIdxDeMirna <- rownames(allDeGenes)[1] %>% as.numeric
+mir$miRNA_ID[rowIdxDeMirna]
+#make a volcano plot
+ggplot(allDeGenes2, 
+       aes(x = logFC, y = -log(adj.P.Val, 10))) +
+  theme_bw() + geom_vline(xintercept = c(-logFCThr,logFCThr), 
+                          linetype="dashed", color = "grey") + 
+  geom_hline(yintercept = -log(adjPvalThresh,10), 
+             linetype="dashed", color = "grey") +
+  geom_point(alpha=0.5)+ 
+  geom_text_repel(aes(label=mirna_label))+#aes(color=!inNeither & numHits > 3)) + 
+  theme_classic() +
+  theme(text  = element_text(size=18), legend.title = element_blank()) + 
+  labs(size = 14, x = expression(paste(log[2], "(miRNA in THRB_Hi/THRB_Low)")), 
+       y = (expression(-log[10](q~value)))) + 
+  #annotate("segment", x=-0.7, y=0, xend=-1.15, yend=1.9, size=2, arrow=arrow(length = unit(0.03, "npc"), type="closed")) + 
+  annotate("segment", x=-1.3, y=2.6, xend=-1.2, yend=3.5, size=1) +#, arrow=arrow(length = unit(0.03, "npc"), type="closed")) + 
+  
+  #annotate("text", x=-1.5, y=1, label="Upregulated in\nendomet. tumors\nwith low THRB expr.", hjust = 0) + 
+  annotate("rect", xmin=-Inf, xmax=-1, ymin=3, ymax=Inf, alpha=0.2, fill="red") +
+  annotate("text", x=-1.5, y=2, label="miRNAs upregulated\nin endomet. tumors\nwith low THRB expr.", hjust = 0)
+
+
+#add arrow
+
+```
+
+## Volcano plot showing miRNA differential expression in tumors with endometrioid histology
+
+
+```{r}
+
+colData(e)$subtype_histology #will do differential expression for the endometrioid and serous tumors
+# Endometrioid      Missing        Mixed       Serous 
+#          304          172           13           53
+
+ec_histology <- "Endometrioid"#"Serous" #
+
+tcga_id_with_histo <- colData(e)[colData(e)$subtype_histology == ec_histology,] %>% rownames()
+
+bound_nuHrRcpt_classif_mirna_filt2 <- bound_nuHrRcpt_classif %>% .[rownames(.) %>% substr(1,12) %in% substr(colnames(mir_t), 1,12),] %>% .[rownames(.) %>% substr(1,12) %in% substr(tcga_id_with_histo, 1,12),] 
+
+mir_t3 <- rownames(bound_nuHrRcpt_classif_mirna_filt2) %>% 
+  substr(1,12) %>%
+  sapply(grep, colnames(mir_t)) %>%
+  unlist %>%
+  unique %>%
+  mir_t[,.] %>%
+  mutate_all(.funs = ~log(.+1, 2))
+
+mir_n3 <- colnames(en) %>% 
+  substr(1,12) %>%
+  sapply(grep, colnames(mir_n)) %>%
+  unlist %>%
+  mir_n[,.] %>%
+  mutate_all(.funs = ~log(.+1, 2))
+
+e_sub <- substr(colnames(mir_t3), 1,12) %>% 
+  sapply(grep,colnames(e)) %>%
+  e[,.]
+en_sub <- substr(colnames(mir_n3), 1,12) %>% 
+  sapply(grep,colnames(en)) %>%
+  en[,.]
+
+
+#############
+i=6
+classif <- colnames(bound_nuHrRcpt_classif)[i]#"classif_ENSG00000082175"
+vars <- c(classif, "seqPlate", "hosp")
+colData_e_stdze <- colData(e_sub)[,vars]
+dsgn <- model.matrix(~ colData(e_sub)[,classif] + colData(e_sub)[,"seqPlate"] + colData(e_sub)$hosp)
+allDeGenes <- returnDeMirnaLimma(mir_t3, dsgn, colOfInt = 2, retAll=T)
+
+logFCThr = 1
+adjPvalThresh = 0.001
+
+allDeGenes2 <- allDeGenes %>% rownames() %>% 
+  as.numeric() %>% mir$miRNA_ID[.] %>%
+  cbind(allDeGenes, mirna=.) %>%
+  as_tibble() %>%
+  mutate(mirna = as.character(mirna),
+         mirna_label = ifelse(abs(logFC) > logFCThr & adj.P.Val < adjPvalThresh,
+                              mirna,""))
+
+rowIdxDeMirna <- rownames(allDeGenes)[1] %>% as.numeric
+mir$miRNA_ID[rowIdxDeMirna]
+#make a volcano plot
+ggplot(allDeGenes2, 
+       aes(x = logFC, y = -log(adj.P.Val, 10))) +
+  theme_bw() + geom_vline(xintercept = c(-logFCThr,logFCThr), 
+                          linetype="dashed", color = "grey") + 
+  geom_hline(yintercept = -log(adjPvalThresh,10), 
+             linetype="dashed", color = "grey") +
+  geom_point(alpha=0.5)+ 
+  geom_text_repel(aes(label=mirna_label))+
+  theme_classic() +
+  theme(text  = element_text(size=18), legend.title = element_blank()) + 
+  labs(size = 14, x = expression(paste(log[2], "(miRNA in THRB_Hi/THRB_Low)")), 
+       y = (expression(-log[10](q~value)))) + 
+  annotate("segment", x=-1.3, y=2.6, xend=-1.2, yend=3.5, size=1) +
+  
+  annotate("rect", xmin=-Inf, xmax=-1, ymin=3, ymax=Inf, alpha=0.2, fill="red") +
+  annotate("text", x=-1.5, y=2, label="miRNAs upregulated\nin endomet. tumors\nwith low THRB expr.", hjust = 0) +
+    ggtitle("Diff miRNA expr in endometrial\ntumors with endometrioid histology")
+
+
+
+```
+
+
+## Volcano plot showing miRNA differential expression in tumors with serous histology
+
+```{r}
+
+ec_histology <- "Serous"
+
+tcga_id_with_histo <- colData(e)[colData(e)$subtype_histology == ec_histology,] %>% rownames()
+
+bound_nuHrRcpt_classif_mirna_filt2 <- bound_nuHrRcpt_classif %>% .[rownames(.) %>% substr(1,12) %in% substr(colnames(mir_t), 1,12),] %>% .[rownames(.) %>% substr(1,12) %in% substr(tcga_id_with_histo, 1,12),] 
+
+mir_t3 <- rownames(bound_nuHrRcpt_classif_mirna_filt2) %>% 
+  substr(1,12) %>%
+  sapply(grep, colnames(mir_t)) %>%
+  unlist %>%
+  unique %>%
+  mir_t[,.] %>%
+  mutate_all(.funs = ~log(.+1, 2))
+
+mir_n3 <- colnames(en) %>% 
+  substr(1,12) %>%
+  sapply(grep, colnames(mir_n)) %>%
+  unlist %>%
+  mir_n[,.] %>%
+  mutate_all(.funs = ~log(.+1, 2))
+
+e_sub <- substr(colnames(mir_t3), 1,12) %>% 
+  sapply(grep,colnames(e)) %>%
+  e[,.]
+en_sub <- substr(colnames(mir_n3), 1,12) %>% 
+  sapply(grep,colnames(en)) %>%
+  en[,.]
+
+
+#############
+i=6
+classif <- colnames(bound_nuHrRcpt_classif)[i]#"classif_ENSG00000082175"
+vars <- c(classif, "seqPlate", "hosp")
+colData_e_stdze <- colData(e_sub)[,vars]
+dsgn <- model.matrix(~ colData(e_sub)[,classif] + colData(e_sub)[,"seqPlate"] + colData(e_sub)$hosp)
+allDeGenes <- returnDeMirnaLimma(mir_t3, dsgn, colOfInt = 2, retAll=T)
+
+logFCThr = 1
+adjPvalThresh = 0.001
+
+allDeGenes2 <- allDeGenes %>% rownames() %>% 
+  as.numeric() %>% mir$miRNA_ID[.] %>%
+  cbind(allDeGenes, mirna=.) %>%
+  as_tibble() %>%
+  mutate(mirna = as.character(mirna),
+         mirna_label = ifelse(abs(logFC) > logFCThr & adj.P.Val < adjPvalThresh,
+                              mirna,""))
+
+rowIdxDeMirna <- rownames(allDeGenes)[1] %>% as.numeric
+mir$miRNA_ID[rowIdxDeMirna]
+#make a volcano plot
+ggplot(allDeGenes2, 
+       aes(x = logFC, y = -log(adj.P.Val, 10))) +
+  theme_bw() + geom_vline(xintercept = c(-logFCThr,logFCThr), 
+                          linetype="dashed", color = "grey") + 
+  geom_hline(yintercept = -log(adjPvalThresh,10), 
+             linetype="dashed", color = "grey") +
+  geom_point(alpha=0.5)+ 
+  geom_text_repel(aes(label=mirna_label))+#aes(color=!inNeither & numHits > 3)) + 
+  theme_classic() +
+  theme(text  = element_text(size=18), legend.title = element_blank()) + 
+  labs(size = 14, x = expression(paste(log[2], "(miRNA in THRB_Hi/THRB_Low)")), 
+       y = (expression(-log[10](q~value)))) + 
+  #annotate("segment", x=-0.7, y=0, xend=-1.15, yend=1.9, size=2, arrow=arrow(length = unit(0.03, "npc"), type="closed")) + 
+  annotate("segment", x=-1.3, y=2.6, xend=-1.2, yend=3.5, size=1) +#, arrow=arrow(length = unit(0.03, "npc"), type="closed")) + 
+  
+  #annotate("text", x=-1.5, y=1, label="Upregulated in\nendomet. tumors\nwith low THRB expr.", hjust = 0) + 
+  annotate("rect", xmin=-Inf, xmax=-1, ymin=3, ymax=Inf, alpha=0.2, fill="red") +
+  annotate("text", x=-1.5, y=2, label="miRNAs upregulated\nin endomet. tumors\nwith low THRB expr.", hjust = 0) + 
+  ggtitle("Diff miRNA expr in endometrial\ntumors with serous histology")
+
+
+```
+
+
+
+## Expression of miRNA-146a across various tissue types
+
+```{r}
+mir146a_expr_adj_nml <- as_tibble(list(id = 2, mir_expr = as.numeric(mir_n2[rowIdxDeMirna,])))
+
+mir146a_expr <- as_tibble(list(id = bound_nuHrRcpt_classif_mirna_filt[,6], 
+                          mir_expr = as.numeric(mir_t2[rowIdxDeMirna,]))) %>%
+  bind_rows(mir146a_expr_adj_nml) %>%
+  mutate(id = factor(id),
+         id = recode(id, "0" = "Loss", #loss = THRB-low
+         "1" = "Baseline", #THRB-high
+         "2" = "Adj. Normal")) 
+
+#statistical test to check difference between 2 groups
+grp0 <- mir146a_expr %>% filter(as.character(id) == "Loss") %>% pull(mir_expr) %>% as.numeric()
+grp1 <- mir146a_expr %>% filter(as.character(id) == "Baseline") %>% pull(mir_expr) %>% as.numeric()
+grp2 <- mir146a_expr %>% filter(as.character(id) == "Adj. Normal") %>% pull(mir_expr) %>% as.numeric()
+
+p1 <- wilcox.test(grp0, grp1) #p1$p.value 
+p2 <- wilcox.test(grp1, grp2) 
+p3 <- wilcox.test(grp0, grp2) 
+
+p.adjust(c(p1$p.value, p2$p.value, p3$p.value), method = "BH")
+
+
+ggplot(mir146a_expr, aes(x=id, y=mir_expr, fill=id)) + 
+  geom_violin() + 
+  geom_jitter(pch=21, alpha=0.5) + 
+  ylab("miRNA-146a expression") +
+  xlab("") + 
+  #ggtitle("Expression of miRNA-146a\nin endometrial cancer") + 
+  scale_fill_manual(values=set2[c(1,2,4)]) +
+  theme_classic() + 
+  theme(legend.position="none", text=element_text(size=18, color="black"))
+  
+ggsave(filename = here::here("output/mir146.png"), width = 5.5, height = 4, units = "in")
+```
+
+
+## Are the THRB-low tumors the same as the Type I endometrial cancers?
+
+
+```{r}
+colDat_e_subst <- colData(e) %>% as_tibble %>% filter(subtype_histology == "Endometrioid" | subtype_histology == "Serous")#, Serous"))
+#colData(e)$classif_ENSG00000151090
+#varsToTest <- colData(e) %>% as_tibble %>% dplyr::select(patient, starts_with("subtype"))
+ft <- fisher.test(colDat_e_subst$subtype_histology, colDat_e_subst$classif_ENSG00000151090)
+table(colDat_e_subst$subtype_histology, colDat_e_subst$classif_ENSG00000151090)
+ft
+```
+
+The THRB-low tumors (with better survival) are more likely to be endometrioid (type I), pvalue = `r round(ft$p.value, 3)`, OR = `r round(ft$estimate, 3)`.
+
+
+# THRB expression in other cancers
+
+we look at THRB expression patterns in other cancer types (in both tumor and normal tissue) and ask whether THRB expression is predictive of survival in other cancers.
+
+```{r}
+
+brca <- readRDS(here("data", "TCGA-BRCA-exp.rds")) %>% clean_dataset()
+luad <- readRDS(here("data", "TCGA-LUAD-exp.rds")) %>% clean_dataset()
+lusc <- readRDS(here("data", "TCGA-LUSC-exp.rds")) %>% clean_dataset()
+
+brca_n <- brca$en
+brca <- brca$et
+
+luad_n <- luad$en
+luad <- luad$et
+
+lusc_n <- lusc$en
+lusc <- lusc$et
+
+ucec_n <- en
+ucec <- e
+
+names_of_dfs <- c("ucec_n","brca_n", "luad_n", "lusc_n", "brca", "luad", "lusc", "ucec")
+
+esr1 = "ENSG00000091831"
+ar = "ENSG00000169083"
+pr = "ENSG00000082175"
+thrb = "ENSG00000151090"
+thra = "ENSG00000126351"
+recepts = c(esr1, ar, pr, thrb, thra)
+```
+
+## What does THRB receptor expression look like in other cancers?
+
+```{r}
+
+thrb_df <- lapply(names_of_dfs, function(x) assay_to_df(eval(parse(text = x)), tum_type = x, gene = thrb)) %>%
+  do.call(rbind, .) %>% 
+  mutate(class_temp = substr(tum_type, start = nchar(tum_type)-1, stop=nchar(tum_type)),
+                   class = ifelse(class_temp == "_n", "adj_nml", "tumor")) %>%
+  select(-class_temp) %>%
+  mutate(tum_type2 = substr(tum_type, 1,4),
+         class=factor(class),
+         tum_name = factor(tum_type2, levels = c("ucec", "brca", "luad", "lusc"),
+                           labels = c("Uterus", "Breast", "Lung Adeno", "Lung Squam")))
+
+
+ggplot(thrb_df, aes(x=tum_name, y=ENSG00000151090, color=class)) +
+  scale_color_manual(values=set2[4:3]) + 
+  geom_boxplot(fill=NA, outlier.shape = NA, size=1, alpha=0.8) + 
+  theme_classic() + 
+  geom_point(pch = 21, alpha=0.8,
+             position = position_jitterdodge(jitter.height = 0, jitter.width = 0.5)) + 
+  xlab("") + ylab("THRB expression (log2(TPM))")
+
+```
+
+## Run receptLoss on other cancer types and look at THRB expression here
+
+```{r}
+brca_res <- receptLoss(exprMatrNml=assay(brca_n), exprMatrTum=assay(brca), nSdBelow=2, minPropPerGroup=0.2)
+luad_res <- receptLoss(exprMatrNml=assay(luad_n), exprMatrTum=assay(luad), nSdBelow=2, minPropPerGroup=0.2)
+lusc_res <- receptLoss(exprMatrNml=assay(lusc_n), exprMatrTum=assay(lusc), nSdBelow=2, minPropPerGroup=0.2)
+
+receptLoss::plotReceptLoss(exprMatrNml = assay(brca_n), exprMatrTum = assay(brca), rldf = brca_res, geneName = thrb, clrs = set2[4:3])
+
+receptLoss::plotReceptLoss(exprMatrNml = assay(luad_n), exprMatrTum = assay(luad), rldf = luad_res, geneName = thrb, clrs = set2[4:3])
+
+receptLoss::plotReceptLoss(exprMatrNml = assay(lusc_n), exprMatrTum = assay(lusc), rldf = lusc_res, geneName = thrb, clrs = set2[4:3])
+```
+
+## Is there a difference in survival between high and low groups based on THRB expression in other tumors? Classify the tumors first, then perform K-M survival analysis
+
+```{r}
+
+colData(brca) <- bindClassToColData(cdat = colData(brca), returnClassif(brca, brca_res, thrb))  %>%
+  bindClassToColData(obj = calc_days_last_fu(colData(brca)$days_to_death,
+                                             colData(brca)$days_to_last_follow_up)) %>% 
+  bindClassToColData(calc_vital_stat(vital_stat = colData(brca)$vital_status, .$days_last_fu))
+
+colData(luad) <- bindClassToColData(cdat = colData(luad), 
+                                    obj = returnClassif(luad, luad_res, thrb)) %>%
+  bindClassToColData(obj = calc_days_last_fu(colData(luad)$days_to_death,
+                                             colData(luad)$days_to_last_follow_up)) %>% 
+  bindClassToColData(calc_vital_stat(vital_stat = colData(luad)$vital_status, .$days_last_fu))
+
+colData(lusc) <- bindClassToColData(cdat = colData(lusc), 
+                                    obj = returnClassif(lusc, lusc_res, thrb)) %>%
+  bindClassToColData(obj = calc_days_last_fu(colData(lusc)$days_to_death,
+                                             colData(lusc)$days_to_last_follow_up)) %>% 
+  bindClassToColData(calc_vital_stat(vital_stat = colData(lusc)$vital_status, .$days_last_fu))
+
+
+plotSurvAndReturnStat(timeToEvent = colData(brca)$days_last_fu/365.25, alive0dead1 = colData(brca)$vital_stat, classif = colData(brca)$classif_ENSG00000151090, surv.col = set2[1:2], gnNm = "BRCA survival based on THRB expression")
+
+plotSurvAndReturnStat(timeToEvent = colData(luad)$days_last_fu/365.25, alive0dead1 = colData(luad)$vital_stat, classif = colData(luad)$classif_ENSG00000151090, surv.col = set2[1:2], gnNm = "LUAD survival based on THRB expression")
+
+plotSurvAndReturnStat(timeToEvent = colData(lusc)$days_last_fu/365.25, alive0dead1 = colData(lusc)$vital_stat, classif = colData(lusc)$classif_ENSG00000151090, surv.col = set2[1:2], gnNm = "LUSC survival based on THRB expression")
+
+
+```
+
+
+# Session Information
+
+```{r}
+sessionInfo()
+```
+
+## Supplementary scripts
+
+The following scripts are found in the file `2019_endomet_smry_suppl.R`.
+
+```{r eval=F}
+
+orderSeqPlate <- function(x){
+  x %>% 
+    group_by(seqPlate) %>%
+    dplyr::count(seqPlate) %>% 
+    arrange(-n)
+}
+
+countSeqPlate <- function(x, sqPlates){
+  x %>%
+    group_by(bin_expr, seqPlate, ensembl_gene_id) %>%
+    dplyr::count(seqPlate) %>%
+    ungroup() %>%
+    mutate(seqPlate = factor(seqPlate, levels=sqPlates)) %>%
+    mutate(bin_expr = factor(bin_expr, c(1,0)))
+}
+
+#scripts for doing GSEA with Fisher's exact test
+#R package: gSEAfish - Set enrichment analysis using Fisher's exact test
+#also provides visualization tools
+ 
+genesetEnrichmentFisher <- function(B, Targ, GS.GS, GS.names){ 
+  #calculates the fisher exact t test for enrichment in a particular set of
+  #target gene entrez IDs (T) among the number of background genes (B). GS.GS
+  #takes the form "hGMT$genesets", where hGMT is a variable that stores the .gmt
+  #file object downloaded from the msigdb website that was read in using the
+  #GMT() function. GS.names takes the form "hGMT$geneset.names"
+  
+  #1. Initialize an empty dataframe
+  t <- unlist(fisher.test(matrix(data = c(1,4,6,2), nrow = 2), conf.int = T))
+  colNam <- c(names(t), "geneset.names", "MatchesBtwTargAndPathway", "NumbGenesInMsigdbPathway", "TargLen", "BackgroundLen")
+  fisherDf <- data.frame(matrix(NA, nrow=1, ncol=13))
+  names(fisherDf) <- colNam
+  
+  TargLen <- length(Targ)
+  #2. Loop through each geneset and calculate pvalues
+  for(i in 1:length(GS.GS)){
+    pathwayEntrezIDs <- GS.GS[[i]] #these are characters
+    M <- length(intersect(Targ, pathwayEntrezIDs)) #number of overlapping genes
+    P <- length(pathwayEntrezIDs) #numb of genes in pathway
+    conting.matrix <- matrix(c(M, TargLen-M, P-M, B-TargLen-P+M), nrow = 2, byrow = TRUE) #create contigency matrix
+    fisherTest <- fisher.test(conting.matrix, conf.int = T)
+    fisherDf <- rbind(fisherDf, c(unlist(fisherTest), GS.names[[i]], M, P, TargLen, B))
+  }
+  fisherDf = fisherDf[-1,]   #remove the row of NA's (in row 1)
+  fisherDf$bhPval <- p.adjust(fisherDf$p.value, method = "BH")
+  fisherDf$bonferroni <- p.adjust(fisherDf$p.value, method = "bonferroni")
+  fisherDf$neg.log10.bhPval <- -log10(as.numeric(fisherDf$bhPval))
+  fisherDf$dataset <-
+    unlist(lapply(strsplit(fisherDf$geneset.names, "_"), function(x) x[1]))
+  fisherDf <- fisherDf[order(fisherDf$bhPval),]
+  #rank by bhPval pbal
+  return(fisherDf)
+}
+
+
+forestplot <- function(d, title, xlab=expression(log[10] *"(Odds Ratio)"), ylab="Pathway", size=12){
+  p <- ggplot(d, aes(x=x, y=y, ymin=ylo, ymax=yhi)) +
+    geom_pointrange(size = 1.25) +
+    coord_flip() +
+    #geom_hline(aes(x=0, yintercept = 1)) +
+    ylab(xlab) +
+    xlab(ylab) + #switch because of the coord_flip() above
+    ggtitle(title) +
+    scale_y_log10() +
+    theme_classic() +
+    geom_text(aes(label=numbMatches)) +
+    guides(alpha=FALSE) + 
+    theme(axis.text.x=element_text(size=size), axis.text.y = element_text(size = 7), legend.text = element_text(size = 12))
+  return(p)
+}
+
+createForestDF <- function(data, title){
+  d <- data.frame(x=data$geneset.names, y=as.numeric(data$`estimate.odds ratio`), ylo = as.numeric(data$conf.int1), yhi = as.numeric(data$conf.int2), pval=as.numeric(data$p.value), numbGeneInPway = data$NumbGenesInMsigdbPathway,
+                  numbMatches=data$MatchesBtwTargAndPathway)
+  d$x <-factor(d$x, levels=d[order(-d$y), "x"])
+  return(forestplot(d, title, xlab=expression("Odds Ratio("*log[10] *" scale)")))
+}
+
+gseWrapper <- function(B, Targ, genesets, geneset.names, qval, OR){
+  #dir can equal "up" or "down" for up or down regulated, respectivtly
+  res_gse <- genesetEnrichmentFisher(B = B, Targ = Targ, GS.GS = genesets, GS.names=geneset.names)
+  res_gse_filt <- res_gse[as.numeric(res_gse$bhPval) < qval & as.numeric(res_gse$`estimate.odds ratio`) > OR & as.numeric(res_gse$conf.int1) > OR,]
+  return(res_gse_filt)
+}
+
+
+readHmKgRctmepathways <- function(gsea_path){
+  hallmark <- GSA.read.gmt(paste0(gsea_path,"h.all.v5.1.entrez.gmt")) #50 genesets
+  kegg <- GSA.read.gmt(paste0(gsea_path,"c2.cp.kegg.v5.1.entrez.gmt")) #185 genesets
+  reactome <- GSA.read.gmt(paste0(gsea_path,"c2.cp.reactome.v5.1.entrez.gmt")) #673 genesets
+  hallmarkKeggReactome <- list(genesets = c(hallmark$genesets, kegg$genesets, reactome$genesets), geneset.names =
+                                 c(hallmark$geneset.names, kegg$geneset.names, reactome$geneset.names), geneset.descriptions =
+                                 c(hallmark$geneset.descriptions, kegg$geneset.descriptions, reactome$geneset.descriptions))
+  return(hallmarkKeggReactome)
+}
+
+ensgToEntrez2 <- function(ensg, geneMap){
+  g <- geneMap %>% 
+    dplyr::select(-ucsc) %>% 
+    distinct %>% 
+    filter(ensembl_gene_id %in% ensg)
+  return(g)
+}
+
+
+geneSymbToEnsg <- function(geneSymb){
+  ensembl = useMart("ensembl",dataset="hsapiens_gene_ensembl")
+  geneEntrez <- getBM(attributes = c("ensembl_gene_id", "hgnc_symbol", "entrezgene"),
+                      filters = "hgnc_symbol",
+                      values = geneSymb,
+                      mart = ensembl)
+  return(geneEntrez)
+}
+
+
+
+
+
+
+twoSdBelowMean <- function(mn, sd){
+  twosdblw <- mn - 2*sd
+  return(twosdblw)
+}
+
+twoSdAboveMean <- function(mn, sd){
+  twosdabv <- mn + 2*sd
+  return(twosdabv)
+}
+
+threeSdBelowMean <- function(mn, sd){
+  threesdblw <- mn - 3*sd
+  return(threesdblw)
+}
+
+threeSdAboveMean <- function(mn, sd){
+  threesdabv <- mn + 3*sd
+  return(threesdabv)
+}
+fourSdBelowMean <- function(mn, sd){
+  fsdblw <- mn - 4*sd
+  return(fsdblw)
+}
+
+fourSdAboveMean <- function(mn, sd){
+  fsdabv <- mn + 4*sd
+  return(fsdabv)
+}
+
+poundToKg <- function(lb){
+  kg_per_lb = 2.2046226218
+  return(lb/kg_per_lb)
+}
+
+inToCm <- function(inches){
+  cm_per_in = 2.54
+  return(cm_per_in*inches)
+}
+
+
+
+
+plotSurvAndReturnStat <- function(timeToEvent, alive0dead1, classif, surv.col, gnNm=""){
+  fit <- survfit(Surv(timeToEvent, alive0dead1) ~ classif)
+  fit.stat <- survdiff(Surv(timeToEvent, alive0dead1) ~ classif)
+  print(fit.stat)
+  #650x250
+  p <- GGally::ggsurv(fit, back.white = T, surv.col = surv.col, size.est = 1.25) + 
+    ylim(c(0,1)) + theme_classic() + 
+    ggtitle(gnNm) +
+    theme(aspect.ratio = 1, legend.title=element_blank(), 
+          text = element_text(size=42, color = "black"), 
+          axis.title=element_blank(),
+          plot.title =element_text(size = 54, margin=margin(0,0,-5,0), face="italic")) +
+  #add the number of patients
+  annotate("text", x = 1, y = .35, label = paste0(names(fit.stat$n)[1], ", N = ",fit.stat$n[1])) +
+  annotate("text", x = 1, y = .15, label = paste0(names(fit.stat$n)[2], ", N = ",fit.stat$n[2])) +
+  theme(plot.margin=grid::unit(c(0,0,0,0), "mm"))
+
+  print(p)
+  return(fit.stat)
+}
+
+plotSurvAndReturnStat2 <- function(timeToEvent, alive0dead1, classif, surv.col, gnNm=""){
+  fit <- survfit(Surv(timeToEvent, alive0dead1) ~ classif)
+  fit.stat <- survdiff(Surv(timeToEvent, alive0dead1) ~ classif)
+  print(fit.stat)
+  #650x250
+  p <- GGally::ggsurv(fit, back.white = T, surv.col = surv.col, size.est = 1.25) + 
+    ylim(c(0,1)) + theme_classic() + 
+    ggtitle(gnNm) +
+    theme(aspect.ratio = 1, legend.title=element_blank(), 
+          text = element_text(size=25, color = "black"), 
+          axis.title=element_blank(),
+          plot.title =element_text(face="italic")) +
+    #add the number of patients
+    annotate("text", x = 1, y = .35, label = paste0(names(fit.stat$n)[1], ", N = ",fit.stat$n[1])) +
+    annotate("text", x = 1, y = .15, label = paste0(names(fit.stat$n)[2], ", N = ",fit.stat$n[2])) +
+    theme(plot.margin=grid::unit(c(0,0,0,0), "mm"))
+  
+  print(p)
+  return(list(fit.stat = fit.stat, fit = fit))
+}
+
+plotSurvAndReturnStat2_likrat <- function(timeToEvent, alive0dead1, classif, surv.col, gnNm=""){
+  fit <- survfit(Surv(timeToEvent, alive0dead1) ~ classif)
+  fit.stat <- survdiff(Surv(timeToEvent, alive0dead1) ~ classif)
+  print(fit.stat)
+  #650x250
+  p <- GGally::ggsurv(fit, back.white = T, surv.col = surv.col, size.est = 1.25) + 
+    ylim(c(0,1)) + theme_classic() + 
+    ggtitle(gnNm) +
+    theme(aspect.ratio = 1, legend.title=element_blank(), 
+          text = element_text(size=25, color = "black"), 
+          axis.title=element_blank(),
+          plot.title =element_text(face="italic")) +
+    #add the number of patients
+    annotate("text", x = 1, y = .35, label = paste0(names(fit.stat$n)[1], ", N = ",fit.stat$n[1])) +
+    annotate("text", x = 1, y = .15, label = paste0(names(fit.stat$n)[2], ", N = ",fit.stat$n[2])) +
+    theme(plot.margin=grid::unit(c(0,0,0,0), "mm"))
+  
+  print(p)
+  return(list(fit.stat = fit.stat, fit = fit))
+}
+
+
+returnDeGenesLimma <- function(expr, design, colOfInt, pval=1, logFC=0, retAll=F){
+  fit_t <- lmFit(object = assay(expr), design = design)
+  ebfit_t <- eBayes(fit_t)
+  if(retAll == T){
+    topTableRes_t <- topTable(ebfit_t, coef = colOfInt, number = Inf) 
+    return(topTableRes_t)
+  }
+  
+  topTableRes_t <- topTable(ebfit_t, coef = colOfInt, number = nrow(assay(expr)), adjust.method = "BH", p.value = pval, lfc = logFC) 
+  return(topTableRes_t)
+}
+
+bindClassToColData <- function(cdat, obj){
+  #if the columns exist, replace them
+  #if the column does not exist, add it
+  cno <- colnames(obj)
+  for(col in 1:ncol(obj)){
+    cdat$temp1 <- obj[,col] #add a temporary column from obj
+    if(cno[col] %in% colnames(cdat)){
+      #the column does exist, so replace it
+      cdat[, cno[col]] <- NULL
+    }
+    colnames(cdat)[which(colnames(cdat) == "temp1")] <- cno[col]
+  }
+  return(cdat)
+}
+
+
+plotGeneHist2 <- function(exprNml, exprTum, isof, title, clrs){
+
+  tidyDf <- as.data.frame(cbind(as.numeric(c(exprTum[isof,], exprNml[isof,])),
+                                as.factor(c(rep("tumor",ncol(exprTum)), rep("normal",ncol(exprNml))))),
+                          stringsAsFactors=FALSE)
+  colnames(tidyDf) <- c("expr", "type")
+  print(mean(exprNml[isof,]))
+  print(twoSdBelowMean(mn=mean(exprNml[isof,]),sd = sd(exprNml[isof,])))
+  expr <- type <- ..density.. <- NULL # Setting the variables to NULL first
+  p1 <- ggplot(tidyDf, aes(x=expr, color=as.factor(type),
+                           fill=as.factor(type),
+                           group=as.factor(type))) +
+    theme_classic() +
+    geom_histogram(data=subset(tidyDf,type == 2),
+                   alpha=0.2, aes(y=..density..), binwidth = .2, 
+                   color=clrs[2], fill=clrs[2]) +
+    geom_rug(alpha=0.3, show.legend=FALSE) +
+    scale_fill_manual(values=clrs) + 
+    scale_color_manual(values=clrs) + 
+    theme(axis.title=element_blank(),
+          axis.text.y=element_blank(),
+          axis.ticks.y=element_blank(),
+          axis.line.y=element_blank(),
+          legend.position="none",
+          text = element_text(size=35, color="black"),
+          plot.title=element_text(face="italic")) + coord_fixed(ratio=15) + 
+    xlim(c(-0.1, 10)) +
+    ylim(c(0,.63))+
+    ggtitle(title) + 
+    stat_function(fun="dnorm", colour=clrs[1],
+                  args=list(mean=mean(exprNml[isof,]),
+                            sd=sd(exprNml[isof,])), linetype="dashed", size=1.5) +
+    geom_vline(size=2, alpha=0.8, color=clrs[1], xintercept = twoSdBelowMean(mn=mean(exprNml[isof,]),sd = sd(exprNml[isof,])))
+    print(p1)
+}
+
+
+
+plotGene_bothHist <- function(exprNml, exprTum, isof, title, clrs){
+
+  tidyDf <- as.data.frame(cbind(as.numeric(c(exprTum[isof,], exprNml[isof,])),
+                                as.factor(c(rep("tumor",ncol(exprTum)), rep("normal",ncol(exprNml))))),
+                          stringsAsFactors=FALSE)
+  colnames(tidyDf) <- c("expr", "type")
+  print(mean(exprNml[isof,]))
+  print(twoSdBelowMean(mn=mean(exprNml[isof,]),sd = sd(exprNml[isof,])))
+  expr <- type <- ..density.. <- NULL # Setting the variables to NULL first
+  p1 <- ggplot(tidyDf, aes(x=expr, color=as.factor(type),
+                           fill=as.factor(type),
+                           group=as.factor(type))) +
+    theme_classic() +
+    geom_histogram(data=subset(tidyDf,type == 1),
+                   alpha=0.2, aes(y=..density..), binwidth = .2, 
+                   color=clrs[1], fill=clrs[1]) +
+    geom_histogram(data=subset(tidyDf,type == 2),
+                   alpha=0.2, aes(y=..density..), binwidth = .2, 
+                   color=clrs[2], fill=clrs[2]) +
+    geom_rug(alpha=0.3, show.legend=FALSE) +
+    scale_fill_manual(values=clrs) + 
+    scale_color_manual(values=clrs) + 
+    theme(axis.title=element_blank(),
+          axis.text.y=element_blank(),
+          axis.ticks.y=element_blank(),
+          axis.line.y=element_blank(),
+          legend.position="none",
+          text = element_text(size=35, color="black"),
+          plot.title=element_text(face="italic")) + coord_fixed(ratio=15) + 
+    xlim(c(-0.1, 10)) +
+    ggtitle(title) + 
+    geom_vline(size=2, alpha=0.8, color=clrs[1], xintercept = twoSdBelowMean(mn=mean(exprNml[isof,]),sd = sd(exprNml[isof,])))
+  print(p1)
+}
+
+
+plotGene_oneHist <- function(exprNml, exprTum, isof, title, clrs, vert_line = TRUE){
+  
+  tidyDf <- as.data.frame(cbind(as.numeric(c(exprTum[isof,], exprNml[isof,])),
+                                as.factor(c(rep("tumor",ncol(exprTum)), rep("normal",ncol(exprNml))))),
+                          stringsAsFactors=FALSE)
+  colnames(tidyDf) <- c("expr", "type")
+  print(mean(exprNml[isof,]))
+  print(twoSdBelowMean(mn=mean(exprNml[isof,]),sd = sd(exprNml[isof,])))
+  expr <- type <- ..density.. <- NULL # Setting the variables to NULL first
+  p1 <- ggplot(tidyDf, aes(x=expr, color=as.factor(type),
+                           fill=as.factor(type),
+                           group=as.factor(type))) +
+    theme_classic() +
+    geom_histogram(data=subset(tidyDf,type == 1),
+                   alpha=0.2, aes(y=..density..), binwidth = .2, 
+                   color=clrs[1], fill=clrs[1]) +
+     scale_fill_manual(values=clrs) + 
+    scale_color_manual(values=clrs) + 
+    theme(axis.title=element_blank(),
+          axis.text.y=element_blank(),
+          axis.ticks.y=element_blank(),
+          axis.line.y=element_blank(),
+          legend.position="none",
+          text = element_text(size=35, color="black"),
+          plot.title=element_text(face="italic")) + coord_fixed(ratio=15) + 
+    xlim(c(-0.1, 10)) +
+    ggtitle(title) #+ 
+  if(vert_line == TRUE){
+    p1 <- p1 + geom_vline(size=2, alpha=0.8, color=clrs[1], xintercept = twoSdBelowMean(mn=mean(exprNml[isof,]),sd = sd(exprNml[isof,])))
+  } 
+  print(p1)
+}
+
+
+plotGene_oneHistNmlCurve <- function(exprNml, exprTum, isof, title, clrs, vert_line = TRUE, histogram = TRUE){
+  
+  tidyDf <- as.data.frame(cbind(as.numeric(c(exprTum[isof,], exprNml[isof,])),
+                                as.factor(c(rep("tumor",ncol(exprTum)), rep("normal",ncol(exprNml))))),
+                          stringsAsFactors=FALSE)
+  colnames(tidyDf) <- c("expr", "type")
+  print(mean(exprNml[isof,]))
+  print(twoSdBelowMean(mn=mean(exprNml[isof,]),sd = sd(exprNml[isof,])))
+  expr <- type <- ..density.. <- NULL # Setting the variables to NULL first
+  p1 <- ggplot(tidyDf, aes(x=expr, color=as.factor(type),
+                           fill=as.factor(type),
+                           group=as.factor(type))) +
+    theme_classic() +
+    scale_fill_manual(values=clrs) + 
+    scale_color_manual(values=clrs) + 
+    theme(axis.title=element_blank(),
+          axis.text.y=element_blank(),
+          axis.ticks.y=element_blank(),
+          axis.line.y=element_blank(),
+          legend.position="none",
+          text = element_text(size=35, color="black"),
+          plot.title=element_text(face="italic")) + coord_fixed(ratio=15) + 
+    xlim(c(-0.1, 10)) +
+    ggtitle(title) + 
+    stat_function(fun="dnorm", colour=clrs[1],
+                  args=list(mean=mean(exprNml[isof,]),
+                            sd=sd(exprNml[isof,])), linetype="dashed", size=1.5)
+    
+  if(histogram == TRUE){
+    p1 <- p1 + geom_histogram(data=subset(tidyDf,type == 1),
+                              alpha=0.2, aes(y=..density..), binwidth = .2, 
+                              color=clrs[1], fill=clrs[1])
+  }
+  if(vert_line == TRUE){
+    p1 <- p1 + geom_vline(size=2, alpha=0.8, color=clrs[1], xintercept = twoSdBelowMean(mn=mean(exprNml[isof,]),sd = sd(exprNml[isof,])))
+  }
+
+  print(p1)
+}
+
+
+
+
+pvalFxn <- function(survDifObj){
+  p.val <- 1 - pchisq(survDifObj$chisq, length(survDifObj$n) - 1)
+  return(p.val)
+}
+
+
+
+sig2star = function(s, breaks=c(-Inf, 0.0001,0.001,0.01,1), labels=c("***","**","*","")) {
+  r <- s
+  r[] <- as.character(cut(s, breaks=breaks, labels)) 
+  r[is.na(r)] <- ""
+  return(r)
+}
+
+
+
+#' Cluster and Reorder Rows and Columns
+#'
+#' Clusters the rows and columns of a numeric matrix using hclust
+#'
+#' @param matr matrix to be clustered
+#' @param dimen Indicates the dimension that the clustering is performed in. One of either "row", "column", or "both". 
+#'
+#' @return returns a matrix of clustered values by either row, column, or both, 
+
+clusterAndReorder <- function(matr, dimen="both"){
+  #dimen can be one of row, column or both
+  if(dimen == "row"){
+    hcl <- hclust(dist(matr))
+    matr.new <- matr[hcl$order,]
+    return(matr.new)
+  } else if(dimen == "column"){
+    hcl <- hclust(dist(t(matr)))
+    matr.new <- matr[,hcl$order]
+    return(matr.new)
+  } else if(dimen == "both"){
+    hcl.r <- hclust(dist(matr))
+    hcl.c <- hclust(dist(t(matr)))
+    matr.new <- matr[hcl.r$order, hcl.c$order]
+    return(matr.new)
+  }
+}
+
+
+
+set2 <- RColorBrewer::brewer.pal(n = 8, "Set2")
+bw <- RColorBrewer::brewer.pal(n = 9, "Greys")
+
+ggBar <- list(
+  theme_classic(),
+  theme(legend.position="top",
+        axis.ticks = element_blank(),
+        axis.text = element_text(size=18, color="black"),
+        axis.text.x = element_text(angle = 90, hjust=1,vjust=0.5),
+        axis.title = element_text(size=22)),
+  scale_y_continuous(expand = c(0,0)))
+
+ggHist <- list(
+  theme_classic(),
+  theme(legend.position="top",
+        axis.text = element_text(size=24)),
+  scale_y_continuous(expand = c(0,0)))
+
+
+ggSeqPlate = list(
+  geom_bar(stat="identity"),
+  facet_grid(.~ensembl_gene_id),
+  theme_classic(), 
+  theme(axis.text=element_text(size=10),
+        axis.text.x = element_text(angle=90, hjust = 1, vjust=0.5),
+        axis.text.y = element_text(size=16)),
+  scale_fill_manual(values=set2[2:1]))
+
+
+clean_dataset <- function(e){
+  
+  #returns adj normal and tumor dataframes
+  print(dim(e))
+  
+  #remove ffpe samples
+  e <- e[,!e$is_ffpe]
+  print("Dimensions after FFPE removed:")
+  print(dim(e)) 
+  
+  #add technical variables
+  colData(e)$hosp <- substr(rownames(colData(e)), 6,7)
+  colData(e)$seqPlate <- substr(rownames(colData(e)), 22,25)
+  
+  ###remove all metaData columns that are NA
+  colData(e) <- colData(e)[,colSums(is.na(colData(e)))<nrow(colData(e))]
+  
+  ##TPM normalization, then log2(tpm+1) transform
+  eu <- assay(e)
+  eu <- scale(eu, center=FALSE, scale=colSums(eu)) * 1000000
+  eu <- log(eu+1, 2)
+  assay(e) <- eu
+  
+  #separate tumor and adjacent normal samples
+  et <- e[,substr(colnames(e),14,15) == "01"] 
+  en <- e[,substr(colnames(e),14,15) == "11"]
+  print("Dimensions of tumor and adj nml dataframes:")
+  print(dim(et)); print(dim(en))
+  
+  #remove duplicates
+  et <- et[,!duplicated(substr(colnames(et),1,12))] 
+  en <- en[,!duplicated(substr(colnames(en),1,12))] 
+  print("Dimensions of tumor and adj nml dataframes (duplicates removed):")
+  print(dim(et)); print(dim(en))
+
+  #remove patients with NA values
+  et <- et[,!apply(assay(et), 2, anyNA)] 
+  en <- en[,!apply(assay(en), 2, anyNA)] 
+  print("Dimensions of tumor and adj nml dataframes (duplicates removed + pts with NA values removed):")
+  print(dim(et)); print(dim(en))
+  
+  #Filter out genes where <20% of patients have a non zero expression value
+  et <- et[rowSums(assay(et)==0)<=ncol(et)*.80,] #select genes w/ less than 80% zeros
+  en <- en[rowSums(assay(en)==0)<=ncol(en)*.80,] #select genes w/ less than 80% zeros
+  print("Dimensions of tumor and adj nml dataframes (duplicates removed + pts with NA values removed + 20% filter):")
+  print(dim(et)); print(dim(en))
+  
+  #get the genes in common between the two
+  genes_in_common <- intersect(rownames(et), rownames(en))
+  et <- et[genes_in_common,]
+  en <- en[genes_in_common,]
+  print("Dimensions of tumor and adj nml dataframes (duplicates removed + pts with NA values removed + 20% filter + intersection):")
+  print(dim(et)); print(dim(en))
+  
+  return(list(et=et, en=en))
+}
+
+
+centroid_plot_elem <- function(){
+  list(ggplot2::theme_classic(), 
+         geom_point(size=3),
+         geom_text(aes(label=Type)))
+}
+
+returnDeMirnaLimma <- function(expr, design, colOfInt, pval=1, logFC=0, retAll=F){
+  fit_t <- lmFit(object = expr, design = design)
+  ebfit_t <- eBayes(fit_t)
+  if(retAll == T){
+    topTableRes_t <- topTable(ebfit_t, coef = colOfInt, number = Inf) 
+    return(topTableRes_t)
+  }
+  
+  topTableRes_t <- topTable(ebfit_t, coef = colOfInt, number = nrow(assay(expr)), adjust.method = "BH", p.value = pval, lfc = logFC) 
+  #topTableRes_t2 <-topTableRes_t[{topTableRes_t$logFC > logFC} | {topTableRes_t$logFC < logFC},] 
+  return(topTableRes_t)
+}
+
+assay_to_df <- function(sum_expt, tum_type, gene){
+  data.frame(assay(sum_expt[gene,])) %>% 
+    t %>% 
+    as_tibble() %>%
+    mutate(tum_type=tum_type)
+}   
+
+
+returnClassif <- function(tum_matr, tum_res, gene){
+  res <- {assay(tum_matr[gene,]) > {tum_res %>% filter(geneNm == gene) %>% pull(lowerBound)}} %>%
+    ifelse(1,0) %>% 
+    as.data.frame() %>% 
+    t() %>% 
+    as.data.frame() %>% rename(!!paste0("classif_", gene) := gene)
+  return(res)
+}
+
+calc_days_last_fu <- function(days_to_death, days_to_last_follow_up){
+  days_last_fu <- ifelse(is.na(days_to_death), days_to_last_follow_up, days_to_death)
+  days_last_fu <- ifelse(days_last_fu < 1, 1, days_last_fu)
+  days_last_fu <- ifelse(days_last_fu > 365.25 * 5, 365.25 * 5, days_last_fu)
+  days_last_fu <- as.data.frame(days_last_fu)
+  return(days_last_fu)
+}
+
+calc_vital_stat <- function(vital_stat, days_last_fu ){
+  vital_stat <- ifelse(vital_stat == "alive", 0, 1)
+  vital_stat <- ifelse(days_last_fu >= 365.25 * 5, 0, vital_stat)
+  vital_stat <- as.data.frame(vital_stat)
+  return(vital_stat)
+}
+
+```
+
